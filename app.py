@@ -84,10 +84,10 @@ def generate_obj_glb(input_image, steps=30, seed=42):
     try:
         # ---------------- Diffusion ----------------
         print("[DEBUG] Loading Diffusion Pipeline...")
-        # custom_pipeline argümanı kaldırıldı. Bu, PeftModel import zincirini atlamaya yardımcı olabilir.
+        # custom_pipeline, Zero123Plus'ın yüklenmesi için gereklidir.
         pipeline = DiffusionPipeline.from_pretrained(
             "sudo-ai/zero123plus-v1.2",
-            # custom_pipeline="zero123plus", # Uyumsuzluk nedeniyle kaldırıldı.
+            custom_pipeline="zero123plus", 
             torch_dtype=torch.float16,
             cache_dir="./ckpts/"
         )
@@ -105,8 +105,8 @@ def generate_obj_glb(input_image, steps=30, seed=42):
         del z_image
         z_image = Image.fromarray(z_image_np)
 
-    except ImportError as e:
-        error_msg = f"Import Hatası: Modelin çalışması için gereken kütüphane uyumsuzluğu. ({e})"
+    except (ImportError, AttributeError) as e:
+        error_msg = f"Bağımlılık Hatası ({type(e).__name__}): InstantMesh, 'diffusers' kütüphanesinde gerekli olan 'Zero123PlusPipeline' sınıfını bulamıyor veya kütüphane uyumsuzluğu yaşıyor. Lütfen çalışma ortamınızdaki 'diffusers' sürümünün (en az 0.24.0) ve 'peft'/'accelerate' kütüphanelerinin uyumlu olduğunu doğrulayın."
         print(f"[HATA] {error_msg}")
         raise gr.Error(error_msg)
     except Exception as e:
@@ -188,7 +188,7 @@ with gr.Blocks() as demo:
     gr.Markdown("<h2><b>InstantMesh 3D Generator - BASE Model (Tesla P100 / 15GB)</b></h2>")
     gr.Markdown("""
 **BASE model** kullanır (Large model P100 GPU’da çalışmaz).  
-- Bu versiyon, ortamınızdaki kütüphane (accelerate/peft) ve GPU (P100/sm\_60) uyumsuzluklarını yönetmek için geliştirilmiştir.  
+- **ÖNEMLİ UYARI:** Uygulama, kütüphane uyumsuzlukları (`diffusers`, `peft`, `accelerate`) nedeniyle çöküyor. Lütfen çalışma ortamınızdaki bu kütüphanelerin uyumlu ve güncel olduğunu doğrulayın.  
 - Daha yüksek detay için `steps` artırılabilir (30-50 önerilir).
 """)
     with gr.Row():
