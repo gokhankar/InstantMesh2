@@ -84,10 +84,10 @@ def generate_obj_glb(input_image, steps=30, seed=42):
     try:
         # ---------------- Diffusion ----------------
         print("[DEBUG] Loading Diffusion Pipeline...")
-        # CRITICAL: ImportError'ı yakalamak için try/except kullanıyoruz
+        # custom_pipeline argümanı kaldırıldı. Bu, PeftModel import zincirini atlamaya yardımcı olabilir.
         pipeline = DiffusionPipeline.from_pretrained(
             "sudo-ai/zero123plus-v1.2",
-            custom_pipeline="zero123plus",
+            # custom_pipeline="zero123plus", # Uyumsuzluk nedeniyle kaldırıldı.
             torch_dtype=torch.float16,
             cache_dir="./ckpts/"
         )
