@@ -27,7 +27,8 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size
 seed_everything(42)
 
 # -------------------- Config --------------------
-config_path = "configs/instant-mesh-base.yaml"  # BASE model
+# BASE model, 15GB VRAM'e daha uygun
+config_path = "configs/instant-mesh-base.yaml"
 config = OmegaConf.load(config_path)
 model_config = config.model_config
 infer_config = config.infer_config
@@ -49,6 +50,7 @@ print("[DEBUG] BASE Reconstruction Model loaded.")
 
 # -------------------- Aggressive VRAM Cleanup --------------------
 def aggressive_cleanup():
+    """GPU hafızasını agresif şekilde temizler."""
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -60,8 +62,14 @@ def aggressive_cleanup():
 # -------------------- Preprocess --------------------
 def preprocess(input_image, remove_bg):
     if remove_bg:
-        session = rembg.new_session()
-        input_image = rembg.remove(input_image, session=session)
+        # NOTE: Bu adım 'onnxruntime' bağımlılığı gerektirir. Ortamda eksikse hata verir.
+        try:
+            session = rembg.new_session()
+            input_image = rembg.remove(input_image, session=session)
+        except Exception as e:
+            print(f"UYARI: Arka plan kaldırma (Rembg) başarısız oldu: {e}")
+            gr.Warning("Rembg başarısız oldu. Lütfen arka planı kaldırılmış bir resim yükleyin.")
+
     input_image = input_image.convert("RGB")
     input_image = input_image.resize((320, 320))
     return input_image
@@ -72,33 +80,55 @@ def generate_obj_glb(input_image, steps=30, seed=42):
     seed_everything(seed)
     aggressive_cleanup()
 
-    # ---------------- Diffusion ----------------
-    print("[DEBUG] Loading Diffusion Pipeline...")
-    pipeline = DiffusionPipeline.from_pretrained(
-        "sudo-ai/zero123plus-v1.2",
-        custom_pipeline="zero123plus",
-        torch_dtype=torch.float16,
-        cache_dir="./ckpts/"
-    )
-    pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
-        pipeline.scheduler.config, timestep_spacing="trailing"
-    )
-    pipeline.to(device)
+    pipeline = None
+    try:
+        # ---------------- Diffusion ----------------
+        print("[DEBUG] Loading Diffusion Pipeline...")
+        # CRITICAL: ImportError'ı yakalamak için try/except kullanıyoruz
+        pipeline = DiffusionPipeline.from_pretrained(
+            "sudo-ai/zero123plus-v1.2",
+            custom_pipeline="zero123plus",
+            torch_dtype=torch.float16,
+            cache_dir="./ckpts/"
+        )
+        pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
+            pipeline.scheduler.config, timestep_spacing="trailing"
+        )
+        pipeline.to(device)
 
-    print("[DEBUG] Running diffusion...")
-    with torch.autocast(device.type, dtype=torch.float16):
-        z_image = pipeline(input_image, num_inference_steps=steps).images[0]
+        print("[DEBUG] Running diffusion...")
+        # VRAM'i korumak için float16'da çalıştırıyoruz
+        with torch.autocast(device.type, dtype=torch.float16):
+            z_image = pipeline(input_image, num_inference_steps=steps).images[0]
 
-    z_image_np = np.array(z_image).copy()
-    del z_image
-    aggressive_cleanup()
-    z_image = Image.fromarray(z_image_np)
+        z_image_np = np.array(z_image).copy()
+        del z_image
+        z_image = Image.fromarray(z_image_np)
+
+    except ImportError as e:
+        error_msg = f"Import Hatası: Modelin çalışması için gereken kütüphane uyumsuzluğu. ({e})"
+        print(f"[HATA] {error_msg}")
+        raise gr.Error(error_msg)
+    except Exception as e:
+        error_msg = f"Diffusion Hatası: {type(e).__name__}: {str(e)}"
+        print(f"[HATA] {error_msg}")
+        # CUDA uyarısını burada gösteriyoruz.
+        if "CUDA capability sm_60" in str(e) or "sm_60" in str(e):
+             raise gr.Error("GPU Uyumluluk Hatası: Tesla P100 (sm_60) GPU'nuz, mevcut PyTorch kurulumuyla tamamen uyumlu değil. Bu, runtime hatalarına neden oluyor.")
+        raise gr.Error(error_msg)
+    finally:
+        # Diffusion pipeline'ı hemen sil
+        if pipeline is not None:
+            del pipeline
+        aggressive_cleanup()
+
 
     # ---------------- Tensor Preparation ----------------
     img_tensor = torch.from_numpy(np.array(z_image)).permute(2,0,1).unsqueeze(0).float() / 255.0
     input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0)
 
     # ---------------- Mesh Reconstruction ----------------
+    # Rekonstrüksiyonu float32'de deniyoruz (index_add_ hatasını önlemek için)
     model.to(device, dtype=torch.float32)
     img_tensor = img_tensor.to(device)
     input_cameras = input_cameras.to(device)
@@ -115,30 +145,41 @@ def generate_obj_glb(input_image, steps=30, seed=42):
     mesh_glb_fpath = os.path.join(output_dir, f"{mesh_basename}.glb")
 
     print("[DEBUG] Extracting mesh...")
-    with torch.no_grad():
-        planes = model.forward_planes(img_tensor, input_cameras)
-        del img_tensor, input_cameras
+    try:
+        with torch.no_grad():
+            planes = model.forward_planes(img_tensor, input_cameras)
+            del img_tensor, input_cameras
+            aggressive_cleanup()
+
+            # Burası, önceki index_add_ hatalarının geldiği yerdir.
+            vertices, faces, vertex_colors = model.extract_mesh(planes, use_texture_map=False, **infer_config)
+            del planes
+            aggressive_cleanup()
+
+            # Adjust coordinates
+            vertices = vertices[:, [1,2,0]]
+
+            vertices_cpu = vertices.cpu().float()
+            faces_cpu = faces.cpu()
+            vertex_colors_cpu = vertex_colors.cpu().float()
+            del vertices, faces, vertex_colors
+            aggressive_cleanup()
+
+            save_obj(vertices_cpu, faces_cpu, vertex_colors_cpu, mesh_fpath)
+            save_glb(vertices_cpu, faces_cpu, vertex_colors_cpu, mesh_glb_fpath)
+
+        print(f"[DEBUG] ✅ OBJ: {mesh_fpath}, GLB: {mesh_glb_fpath}")
+    except RuntimeError as e:
+        error_msg = f"Rekonstrüksiyon Hatası (RuntimeError): {e}. Bu, genellikle P100 GPU'nun (sm_60) özel InstantMesh/FlexiCubes çekirdekleri ile uyumsuzluğundan kaynaklanır."
+        print(f"[HATA] {error_msg}")
+        raise gr.Error(error_msg)
+    except Exception as e:
+        error_msg = f"Rekonstrüksiyon Hatası: {e}"
+        print(f"[HATA] {error_msg}")
+        raise gr.Error(error_msg)
+    finally:
+        model.to("cpu")
         aggressive_cleanup()
-
-        vertices, faces, vertex_colors = model.extract_mesh(planes, use_texture_map=False, **infer_config)
-        del planes
-        aggressive_cleanup()
-
-        # Adjust coordinates
-        vertices = vertices[:, [1,2,0]]
-
-        vertices_cpu = vertices.cpu().float()
-        faces_cpu = faces.cpu()
-        vertex_colors_cpu = vertex_colors.cpu().float()
-        del vertices, faces, vertex_colors
-        aggressive_cleanup()
-
-        save_obj(vertices_cpu, faces_cpu, vertex_colors_cpu, mesh_fpath)
-        save_glb(vertices_cpu, faces_cpu, vertex_colors_cpu, mesh_glb_fpath)
-
-    print(f"[DEBUG] ✅ OBJ: {mesh_fpath}, GLB: {mesh_glb_fpath}")
-    model.to("cpu")
-    aggressive_cleanup()
 
     return mesh_fpath, mesh_glb_fpath
 
@@ -147,8 +188,8 @@ with gr.Blocks() as demo:
     gr.Markdown("<h2><b>InstantMesh 3D Generator - BASE Model (Tesla P100 / 15GB)</b></h2>")
     gr.Markdown("""
 **BASE model** kullanır (Large model P100 GPU’da çalışmaz).  
-- Daha yüksek stabilite ve daha hızlı.  
-- Daha fazla detay için `steps` artırılabilir (30-50 önerilir).
+- Bu versiyon, ortamınızdaki kütüphane (accelerate/peft) ve GPU (P100/sm\_60) uyumsuzluklarını yönetmek için geliştirilmiştir.  
+- Daha yüksek detay için `steps` artırılabilir (30-50 önerilir).
 """)
     with gr.Row():
         with gr.Column():
@@ -156,7 +197,7 @@ with gr.Blocks() as demo:
             remove_bg = gr.Checkbox(label="Arka Planı Kaldır (Rembg)", value=True)
             steps = gr.Slider(label="Diffusion Adımları", minimum=20, maximum=50, value=30, step=5)
             seed = gr.Number(value=42, label="Seed", precision=0)
-            generate_btn = gr.Button("3D Model Oluştur (OBJ/GLB)")
+            generate_btn = gr.Button("3D Model Oluştur (OBJ/GLB)", variant="primary")
         with gr.Column():
             output_obj = gr.File(label="OBJ Dosyası")
             output_glb = gr.File(label="GLB Dosyası")
