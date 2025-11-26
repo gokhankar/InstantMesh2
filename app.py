@@ -27,7 +27,6 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size
 seed_everything(42)
 
 # -------------------- Config --------------------
-# BASE model, 15GB VRAM'e daha uygun
 config_path = "configs/instant-mesh-base.yaml"
 config = OmegaConf.load(config_path)
 model_config = config.model_config
@@ -50,7 +49,6 @@ print("[DEBUG] BASE Reconstruction Model loaded.")
 
 # -------------------- Aggressive VRAM Cleanup --------------------
 def aggressive_cleanup():
-    """GPU hafızasını agresif şekilde temizler."""
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -62,7 +60,6 @@ def aggressive_cleanup():
 # -------------------- Preprocess --------------------
 def preprocess(input_image, remove_bg):
     if remove_bg:
-        # NOTE: Bu adım 'onnxruntime' bağımlılığı gerektirir. Ortamda eksikse hata verir.
         try:
             session = rembg.new_session()
             input_image = rembg.remove(input_image, session=session)
@@ -82,12 +79,10 @@ def generate_obj_glb(input_image, steps=30, seed=42):
 
     pipeline = None
     try:
-        # ---------------- Diffusion ----------------
         print("[DEBUG] Loading Diffusion Pipeline...")
-        # custom_pipeline, Zero123Plus'ın yüklenmesi için gereklidir.
         pipeline = DiffusionPipeline.from_pretrained(
             "sudo-ai/zero123plus-v1.2",
-            custom_pipeline="zero123plus", 
+            custom_pipeline="zero123plus",
             torch_dtype=torch.float16,
             cache_dir="./ckpts/"
         )
@@ -97,7 +92,6 @@ def generate_obj_glb(input_image, steps=30, seed=42):
         pipeline.to(device)
 
         print("[DEBUG] Running diffusion...")
-        # VRAM'i korumak için float16'da çalıştırıyoruz
         with torch.autocast(device.type, dtype=torch.float16):
             z_image = pipeline(input_image, num_inference_steps=steps).images[0]
 
@@ -106,37 +100,29 @@ def generate_obj_glb(input_image, steps=30, seed=42):
         z_image = Image.fromarray(z_image_np)
 
     except (ImportError, AttributeError) as e:
-        error_msg = f"Bağımlılık Hatası ({type(e).__name__}): InstantMesh, 'diffusers' kütüphanesinde gerekli olan 'Zero123PlusPipeline' sınıfını bulamıyor veya kütüphane uyumsuzluğu yaşıyor. Lütfen çalışma ortamınızdaki 'diffusers' sürümünün (en az 0.24.0) ve 'peft'/'accelerate' kütüphanelerinin uyumlu olduğunu doğrulayın."
+        error_msg = f"Bağımlılık Hatası ({type(e).__name__}): diffusers Zero123PlusPipeline bulunamadı veya kütüphane uyumsuzluğu var."
         print(f"[HATA] {error_msg}")
         raise gr.Error(error_msg)
     except Exception as e:
         error_msg = f"Diffusion Hatası: {type(e).__name__}: {str(e)}"
         print(f"[HATA] {error_msg}")
-        # CUDA uyarısını burada gösteriyoruz.
-        if "CUDA capability sm_60" in str(e) or "sm_60" in str(e):
-             raise gr.Error("GPU Uyumluluk Hatası: Tesla P100 (sm_60) GPU'nuz, mevcut PyTorch kurulumuyla tamamen uyumlu değil. Bu, runtime hatalarına neden oluyor.")
+        if "CUDA capability sm_60" in str(e):
+            raise gr.Error("GPU Uyumluluk Hatası: Tesla P100 (sm_60) uyumsuz.")
         raise gr.Error(error_msg)
     finally:
-        # Diffusion pipeline'ı hemen sil
         if pipeline is not None:
             del pipeline
         aggressive_cleanup()
 
-
-    # ---------------- Tensor Preparation ----------------
     img_tensor = torch.from_numpy(np.array(z_image)).permute(2,0,1).unsqueeze(0).float() / 255.0
     input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0)
 
-    # ---------------- Mesh Reconstruction ----------------
-    # Rekonstrüksiyonu float32'de deniyoruz (index_add_ hatasını önlemek için)
     model.to(device, dtype=torch.float32)
     img_tensor = img_tensor.to(device)
     input_cameras = input_cameras.to(device)
 
-    # Initialize FlexiCubes geometry
     model.init_flexicubes_geometry(device, fovy=30.0)
 
-    # Output directory
     output_dir = "/content/outputs"
     os.makedirs(output_dir, exist_ok=True)
     timestamp = int(time.time())
@@ -151,12 +137,10 @@ def generate_obj_glb(input_image, steps=30, seed=42):
             del img_tensor, input_cameras
             aggressive_cleanup()
 
-            # Burası, önceki index_add_ hatalarının geldiği yerdir.
             vertices, faces, vertex_colors = model.extract_mesh(planes, use_texture_map=False, **infer_config)
             del planes
             aggressive_cleanup()
 
-            # Adjust coordinates
             vertices = vertices[:, [1,2,0]]
 
             vertices_cpu = vertices.cpu().float()
@@ -168,15 +152,9 @@ def generate_obj_glb(input_image, steps=30, seed=42):
             save_obj(vertices_cpu, faces_cpu, vertex_colors_cpu, mesh_fpath)
             save_glb(vertices_cpu, faces_cpu, vertex_colors_cpu, mesh_glb_fpath)
 
-        print(f"[DEBUG] ✅ OBJ: {mesh_fpath}, GLB: {mesh_glb_fpath}")
+        print(f"[DEBUG] OBJ: {mesh_fpath}, GLB: {mesh_glb_fpath}")
     except RuntimeError as e:
-        error_msg = f"Rekonstrüksiyon Hatası (RuntimeError): {e}. Bu, genellikle P100 GPU'nun (sm_60) özel InstantMesh/FlexiCubes çekirdekleri ile uyumsuzluğundan kaynaklanır."
-        print(f"[HATA] {error_msg}")
-        raise gr.Error(error_msg)
-    except Exception as e:
-        error_msg = f"Rekonstrüksiyon Hatası: {e}"
-        print(f"[HATA] {error_msg}")
-        raise gr.Error(error_msg)
+        raise gr.Error(f"Rekonstrüksiyon Hatası: {e}")
     finally:
         model.to("cpu")
         aggressive_cleanup()
@@ -185,11 +163,11 @@ def generate_obj_glb(input_image, steps=30, seed=42):
 
 # -------------------- Gradio UI --------------------
 with gr.Blocks() as demo:
-    gr.Markdown("<h2><b>InstantMesh 3D Generator - BASE Model (Tesla P100 / 15GB)</b></h2>")
+    gr.Markdown("<h2><b>InstantMesh 3D Generator - BASE Model (Tesla P100)</b></h2>")
     gr.Markdown("""
-**BASE model** kullanır (Large model P100 GPU’da çalışmaz).  
-- **ÖNEMLİ UYARI:** Uygulama, kütüphane uyumsuzlukları (`diffusers`, `peft`, `accelerate`) nedeniyle çöküyor. Lütfen çalışma ortamınızdaki bu kütüphanelerin uyumlu ve güncel olduğunu doğrulayın.  
-- Daha yüksek detay için `steps` artırılabilir (30-50 önerilir).
+**BASE model** kullanır (Large model P100 GPU’da çalışmaz).
+- Kütüphane uyumsuzluklarına dikkat edin (`diffusers`, `accelerate`, `peft`).
+- Detay seviyesi için steps değerini artırabilirsiniz.
 """)
     with gr.Row():
         with gr.Column():
