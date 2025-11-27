@@ -13,7 +13,7 @@ trimesh
 rembg
 transformers>=4.36.0
 diffusers>=0.24.0
-peft>=0.7.0
+peft>=0.17.0
 bitsandbytes
 imageio[ffmpeg]
 xatlas
