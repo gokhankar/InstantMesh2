@@ -1,4 +1,5 @@
 # Burada büyük obj ve glb üretenler calisti
+import time
 
 import os
 import time
@@ -14,6 +15,7 @@ from pytorch_lightning import seed_everything
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
 from huggingface_hub import hf_hub_download
 import gradio as gr
+import uuid
 
 # src klasöründeki yardımcı dosyaları dahil edin. 
 from src.utils.train_util import instantiate_from_config
@@ -183,7 +185,7 @@ seed_everything(42)
 
 # -------------------- Config (BASE Model) --------------------
 # LARGE model hafıza hatası verdiği için BASE modele geri dönülüyor
-config_path = "configs/instant-mesh-base.yaml" 
+config_path = "configs/instant-mesh-large.yaml" 
 config = OmegaConf.load(config_path)
 model_config = config.model_config
 infer_config = config.infer_config
@@ -191,16 +193,16 @@ infer_config = config.infer_config
 # YÜKSEK KALİTE AYARI: Doku Çözünürlüğünü (texture_size) 1024'e Yükseltme
 # Bu, BASE modelinden daha keskin dokular elde etmeyi amaçlar.
 # Orijinal BASE config'de 512 veya 256 olabilir.
-infer_config.texture_size = 1024
+infer_config.texture_size = 2048
 print(f"[DEBUG] Doku Çözünürlüğü (texture_size) {infer_config.texture_size} olarak ayarlandı.")
 
 
 # -------------------- Reconstruction Model (BASE) --------------------
-print("[DEBUG] Loading BASE Reconstruction Model...")
+print("[DEBUG] Loading LARGE Reconstruction Model...")
 # BASE model checkpoint dosyası indiriliyor
 model_ckpt_path = hf_hub_download(
     repo_id="TencentARC/InstantMesh",
-    filename="instant_mesh_base.ckpt", # BASE model dosyası
+    filename="instant_mesh_large.ckpt", # BASE model dosyası
     repo_type="model",
     cache_dir="./ckpts/"
 )
@@ -209,7 +211,7 @@ state_dict = torch.load(model_ckpt_path, map_location="cpu")["state_dict"]
 state_dict = {k[14:]: v for k, v in state_dict.items() if k.startswith("lrm_generator.") and "source_camera" not in k}
 model.load_state_dict(state_dict, strict=False)
 model = model.to("cpu").eval()
-print("[DEBUG] BASE Reconstruction Model loaded.")
+print("[DEBUG] LARGE Reconstruction Model loaded.")
 
 # -------------------- Aggressive VRAM Cleanup --------------------
 def aggressive_cleanup():
@@ -239,9 +241,16 @@ def preprocess(input_image, remove_bg):
     return input_image
 
 # -------------------- OBJ/GLB Generation --------------------
-def generate_obj_glb(input_image, steps=50, seed=42): # steps varsayılanı 50
+def generate_obj_glb(input_image, steps=50, seed=None): # steps varsayılanı 50
     global device, model
+    if seed is None:
+
+
+        seed = int(time.time())
+
     seed_everything(seed)
+
+    print(f"[DEBUG] Random seed: {seed}")
     aggressive_cleanup()
 
     pipeline = None
@@ -293,12 +302,28 @@ def generate_obj_glb(input_image, steps=50, seed=42): # steps varsayılanı 50
 
     model.init_flexicubes_geometry(device, fovy=30.0)
 
-    output_dir = "/content/outputs"
-    os.makedirs(output_dir, exist_ok=True)
+    # Output directory handling - flexible for local and server
+    base_output_dir = "outputs"
+    if os.path.exists("/root/InstantMesh2"):
+        base_output_dir = "/root/InstantMesh2/outputs"
+    else:
+        base_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs')
+
+    os.makedirs(base_output_dir, exist_ok=True)
+    
     timestamp = int(time.time())
-    mesh_basename = f"mesh_{timestamp}"
-    mesh_fpath = os.path.join(output_dir, f"{mesh_basename}.obj")
-    mesh_glb_fpath = os.path.join(output_dir, f"{mesh_basename}.glb")
+    unique_id = uuid.uuid4().hex[:8]
+    mesh_basename = f"mesh_{timestamp}_{unique_id}"
+    mesh_fpath = os.path.join(base_output_dir, f"{mesh_basename}.obj")
+    mesh_glb_fpath = os.path.join(base_output_dir, f"{mesh_basename}.glb")
+
+    # Debug Image Stats to verify new input
+    if isinstance(input_image, Image.Image):
+        # Calculate a simple hash/stat of the image to verify it changed
+        img_stat = np.array(input_image).mean()
+        print(f"[DEBUG] Processing Image. Size: {input_image.size}, Mean Color: {img_stat:.2f}, ID: {unique_id}")
+    elif isinstance(input_image, torch.Tensor):
+         print(f"[DEBUG] Processing Tensor Image. Shape: {input_image.shape}, ID: {unique_id}")
 
     print("[DEBUG] Extracting mesh...")
     try:
@@ -379,7 +404,7 @@ with gr.Blocks() as demo:
             input_image = gr.Image(label="Giriş Resmi", type="pil")
             remove_bg = gr.Checkbox(label="Arka Planı Kaldır (Rembg)", value=True)
             # Varsayılan değeri 50'ye yükseltiyoruz
-            steps = gr.Slider(label="Diffusion Adımları (Maksimum 50)", minimum=20, maximum=50, value=50, step=5) 
+            steps = gr.Slider(label="Diffusion Adımları (Maksimum 50)", minimum=20, maximum=100, value=75, step=5) 
             seed = gr.Number(value=42, label="Seed", precision=0)
             generate_btn = gr.Button("3D Model Oluştur (OBJ/GLB)", variant="primary")
         with gr.Column():
@@ -440,7 +465,7 @@ demo.launch(server_name="0.0.0.0", share=True)
 # print(f"[{time.strftime('%H:%M:%S')}] [CONFIG] Seed set to {SEED}.")
 
 # # -------------------- Config --------------------
-# config_path = "configs/instant-mesh-base.yaml"
+# config_path = "configs/instant-mesh-large.yaml"
 # try:
 #     print(f"[{time.strftime('%H:%M:%S')}] [CONFIG] Loading config from {config_path}...")
 #     config = OmegaConf.load(config_path)
@@ -453,11 +478,11 @@ demo.launch(server_name="0.0.0.0", share=True)
 
 
 # # -------------------- Model Yükleme: Rekonstrüksiyon Modeli (BASE) --------------------
-# print(f"[{time.strftime('%H:%M:%S')}] [MODEL] Loading BASE Reconstruction Model...")
+# print(f"[{time.strftime('%H:%M:%S')}] [MODEL] Loading LARGE Reconstruction Model...")
 # try:
 #     model_ckpt_path = hf_hub_download(
 #         repo_id="TencentARC/InstantMesh",
-#         filename="instant_mesh_base.ckpt",
+#         filename="instant_mesh_large.ckpt",
 #         repo_type="model",
 #         cache_dir="./ckpts/"
 #     )
@@ -469,7 +494,7 @@ demo.launch(server_name="0.0.0.0", share=True)
     
 #     model.load_state_dict(state_dict, strict=False)
 #     model = model.to("cpu").eval()
-#     print(f"[{time.strftime('%H:%M:%S')}] [MODEL] BASE Reconstruction Model loaded and set to CPU.")
+#     print(f"[{time.strftime('%H:%M:%S')}] [MODEL] LARGE Reconstruction Model loaded and set to CPU.")
 # except Exception as e:
 #     print(f"[FATAL ERROR] Reconstruction Model loading failed: {e}")
 #     sys.exit(1)
@@ -578,7 +603,7 @@ demo.launch(server_name="0.0.0.0", share=True)
 #     print(f"[{time.strftime('%H:%M:%S')}] [RECON] Flexicubes geometry initialized.")
 
 #     # Çıktı yollarını hazırla
-#     output_dir = "/content/outputs"
+#     output_dir = "/root/InstantMesh2/outputs"
 #     os.makedirs(output_dir, exist_ok=True)
 #     timestamp = int(time.time())
 #     mesh_basename = f"mesh_{timestamp}"
@@ -652,7 +677,7 @@ demo.launch(server_name="0.0.0.0", share=True)
 #         with gr.Column():
 #             input_image = gr.Image(label="Giriş Resmi (Objektif Odaklı, Temiz Arka Plan Önerilir)", type="pil")
 #             remove_bg = gr.Checkbox(label="Arka Planı Kaldır (Rembg)", value=True)
-#             steps = gr.Slider(label="Diffusion Adımları (Daha fazla adım = Daha iyi/daha uzun)", minimum=20, maximum=50, value=30, step=5)
+#             steps = gr.Slider(label="Diffusion Adımları (Daha fazla adım = Daha iyi/daha uzun)", minimum=20, maximum=100, value=30, step=5)
 #             seed = gr.Number(value=SEED, label="Seed", precision=0)
 #             generate_btn = gr.Button("3D Model Oluştur (OBJ/GLB)", variant="primary")
 #         with gr.Column():
@@ -967,7 +992,7 @@ demo.launch(server_name="0.0.0.0", share=True)
 
 #     model.init_flexicubes_geometry(device, fovy=30.0)
 
-#     output_dir = "/content/outputs"
+#     output_dir = "/root/InstantMesh2/outputs"
 #     os.makedirs(output_dir, exist_ok=True)
 #     timestamp = int(time.time())
 #     mesh_basename = f"mesh_{timestamp}"
@@ -1190,13 +1215,13 @@ demo.launch(server_name="0.0.0.0", share=True)
 #         raise gr.Error(f"GLB kaydı başarısız: {e}")
 
 # # -------------------- Config & Model --------------------
-# config_path = "configs/instant-mesh-base.yaml"
+# config_path = "configs/instant-mesh-large.yaml"
 # config = OmegaConf.load(config_path)
 # model_config = config.model_config
 # infer_config = config.infer_config
 
 # # Yüksek detay doku çözünürlüğü
-# infer_config.texture_size = 1024
+# infer_config.texture_size = 2048
 # print(f"[DEBUG] texture_size = {infer_config.texture_size}")
 
 # # Reconstruction model checkpoint (LARGE)
@@ -1402,7 +1427,7 @@ demo.launch(server_name="0.0.0.0", share=True)
 #         with gr.Column():
 #             input_image = gr.Image(label="Giriş Resmi", type="pil")
 #             remove_bg = gr.Checkbox(label="Arka Planı Kaldır (Rembg)", value=True)
-#             steps = gr.Slider(label="Diffusion Adımları (Steps)", minimum=20, maximum=50, value=40, step=5)
+#             steps = gr.Slider(label="Diffusion Adımları (Steps)", minimum=20, maximum=100, value=40, step=5)
 #             seed = gr.Number(value=42, label="Seed", precision=0)
 #             generate_btn = gr.Button("3D Model Oluştur (OBJ/GLB)", variant="primary")
 #         with gr.Column():
